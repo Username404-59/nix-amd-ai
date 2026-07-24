@@ -13,6 +13,8 @@
   # build path. See noamsto/nix-amd-ai#28.
   lemonadePackage = pkgs.lemonade.override {withDesktopApp = cfg.lemonade.desktopApp.enable;};
 
+  vllmPkg = pkgs.vllm-rocm.override {gpuTarget = cfg.vllmGpuTarget;};
+
   # 4096-byte pages: pages = GiB * 1024^3 / 4096 = GiB * 262144.
   gttPages = gib: gib * 262144;
 
@@ -61,6 +63,9 @@
     // optionalAttrs (cfg.enableLemonade && cfg.enableROCm && cfg.enableImageGen) {
       "lemonade/backends/sdcpp-rocm".source = "${pkgs.stable-diffusion-cpp-rocm}/bin/sd-server";
     }
+    // optionalAttrs (cfg.enableLemonade && cfg.enableROCm && cfg.enableVllm) {
+      "lemonade/backends/vllm-rocm".source = "${vllmPkg}/bin/vllm-server";
+    }
     // optionalAttrs (cfg.enableLemonade && cfg.enableVulkan) {
       "lemonade/backends/llamacpp-vulkan".source = "${pkgs.llama-cpp-vulkan}/bin/llama-server";
       "lemonade/backends/whispercpp-vulkan".source = "${pkgs.whisper-cpp-vulkan}/bin/whisper-server";
@@ -75,7 +80,14 @@
   # their env hook when v10.7.0 removed migrate_from_env.
   lemonadeDefaults =
     {
-      global_timeout = 0;
+      # 0 disables lemond's 300s request cutoff for llama.cpp (lemonade#1364).
+      # But vLLM passes this same value as its startup-readiness timeout, where
+      # 0 means "0 attempts" and the server never gets time to boot — so give it
+      # a large finite window instead. See noamsto/nix-amd-ai#63.
+      global_timeout =
+        if cfg.enableVllm
+        then 3600
+        else 0;
       llamacpp =
         {
           args = "--flash-attn ${cfg.lemonade.flashAttn}";
@@ -98,6 +110,9 @@
         {cpu_bin = lemonadeBackendBin "sdcpp-cpu";}
         // optionalAttrs cfg.enableROCm {rocm_bin = lemonadeBackendBin "sdcpp-rocm";}
         // optionalAttrs cfg.enableVulkan {vulkan_bin = lemonadeBackendBin "sdcpp-vulkan";};
+    }
+    // optionalAttrs (cfg.enableROCm && cfg.enableVllm) {
+      vllm.rocm_bin = lemonadeBackendBin "vllm-rocm";
     };
   lemonadeDefaultsFile = (pkgs.formats.json {}).generate "lemonade-defaults.json" lemonadeDefaults;
 in {
@@ -147,6 +162,28 @@ in {
         sd-cpp:rocm when enableROCm and sd-cpp:vulkan when enableVulkan) into
         lemonade. Disable to drop ~150 MB CPU-only / ~1.5 GB with ROCm from
         the closure if you only use lemonade for LLM inference.
+      '';
+    };
+
+    enableVllm = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Whether to wire the vLLM ROCm backend (vllm:rocm) into lemonade,
+        repackaged from the upstream lemonade-sdk/vllm-rocm prebuilt. Requires
+        enableROCm. Strix Halo (gfx1151) needs a kernel with the CWSR fix;
+        lemonade reports vllm:rocm as unsupported otherwise. Experimental —
+        see noamsto/nix-amd-ai#63.
+      '';
+    };
+
+    vllmGpuTarget = mkOption {
+      type = types.enum ["gfx1150" "gfx1151"];
+      default = "gfx1150";
+      description = ''
+        Which lemonade-sdk/vllm-rocm prebuilt to install: gfx1150 (Strix Point)
+        or gfx1151 (Strix Halo). Each bundles a TheRock ROCm built for that
+        exact target.
       '';
     };
 
@@ -292,6 +329,10 @@ in {
       {
         assertion = !cfg.enableFastFlowLM || cfg.enableNPU;
         message = "hardware.amd-npu.enableFastFlowLM requires enableNPU = true (FastFlowLM runs on the NPU).";
+      }
+      {
+        assertion = !cfg.enableVllm || (cfg.enableROCm && cfg.enableLemonade);
+        message = "hardware.amd-npu.enableVllm requires enableROCm and enableLemonade = true (vLLM runs on the ROCm GPU under lemonade).";
       }
       {
         assertion = cfg.gpuMemory.pagePoolSizeGiB == null || cfg.gpuMemory.ttmSizeGiB != null;
