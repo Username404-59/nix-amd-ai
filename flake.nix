@@ -325,6 +325,69 @@
                 ];
               }).config.systemd.services.lemond.environment.LEMONADE_DEFAULTS_PATH;
 
+            # lemonade.settings must deep-merge over the module's computed
+            # defaults — overriding one key without dropping its siblings — and
+            # the unit must re-apply them on every start, else the option is
+            # inert on any host that already persisted a config.json.
+            module-eval-lemonade-settings = let
+              sys =
+                (inputs.nixpkgs.lib.nixosSystem {
+                  inherit system;
+                  modules = [
+                    inputs.self.nixosModules.default
+                    {
+                      boot.loader.grub.enable = false;
+                      fileSystems."/" = {
+                        device = "/dev/sda1";
+                        fsType = "ext4";
+                      };
+                      hardware.amd-npu = {
+                        enable = true;
+                        enableLemonade = true;
+                        lemonade = {
+                          user = "testuser";
+                          settings = {
+                            max_loaded_models = -1;
+                            llamacpp.args = "--custom";
+                          };
+                        };
+                      };
+                      users.users.testuser = {
+                        isNormalUser = true;
+                        extraGroups = ["video" "render"];
+                      };
+                    }
+                  ];
+                }).config;
+            in
+              pkgs.runCommand "module-eval-lemonade-settings" {
+                nativeBuildInputs = [pkgs.jq];
+                defaults = sys.systemd.services.lemond.environment.LEMONADE_DEFAULTS_PATH;
+                unit = sys.systemd.units."lemond.service".unit;
+              } ''
+                jq -e '.max_loaded_models == -1' "$defaults" >/dev/null
+                jq -e '.llamacpp.args == "--custom"' "$defaults" >/dev/null
+                jq -e '.llamacpp.cpu_bin | startswith("/etc/lemonade/backends/")' "$defaults" >/dev/null
+
+                # Run the unit's own ExecStartPre against a config that has both a
+                # stale module-managed key and a user-only key, and assert the merge
+                # direction — a broken jq expression would otherwise ship green.
+                reconcile=$(sed -n 's/^ExecStartPre=//p' "$unit"/lemond.service)
+                export HOME=$TMPDIR/home
+                mkdir -p "$HOME/.cache/lemonade"
+                cfg=$HOME/.cache/lemonade/config.json
+                echo '{"host":"0.0.0.0","max_loaded_models":1,"llamacpp":{"args":"--stale"}}' >"$cfg"
+                chmod 600 "$cfg"
+                "$reconcile"
+
+                jq -e '.max_loaded_models == -1' "$cfg" >/dev/null   # module key re-applied
+                jq -e '.llamacpp.args == "--custom"' "$cfg" >/dev/null
+                jq -e '.host == "0.0.0.0"' "$cfg" >/dev/null         # user-only key preserved
+                [ "$(stat -c %a "$cfg")" = 600 ]                     # mode not widened
+
+                touch $out
+              '';
+
             # GTT headroom: configured system emits the ttm modprobe line with
             # GiB→page conversion; default system emits no ttm line.
             module-eval-gtt = let
