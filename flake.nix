@@ -325,6 +325,82 @@
                 ];
               }).config.systemd.services.lemond.environment.LEMONADE_DEFAULTS_PATH;
 
+            # The warning must fire on gfx1151 below the CWSR-fix kernel whether
+            # the signal is gpuTarget or the older vllmGpuTarget, and stay silent
+            # on gfx1150 or a new-enough kernel.
+            module-eval-cwsr-warning = let
+              mkSys = extraModule:
+                (inputs.nixpkgs.lib.nixosSystem {
+                  inherit system;
+                  modules = [
+                    inputs.self.nixosModules.default
+                    (pkgs.lib.recursiveUpdate {
+                        boot.loader.grub.enable = false;
+                        fileSystems."/" = {
+                          device = "/dev/sda1";
+                          fsType = "ext4";
+                        };
+                        hardware.amd-npu = {
+                          enable = true;
+                          enableNPU = false;
+                          enableFastFlowLM = false;
+                          enableLemonade = true;
+                          enableROCm = true;
+                          lemonade.user = "testuser";
+                        };
+                        users.users.testuser = {
+                          isNormalUser = true;
+                          extraGroups = ["video" "render"];
+                        };
+                      }
+                      extraModule)
+                  ];
+                }).config.warnings;
+              # The bug this check guards: an llamacpp-only gfx1151 host that
+              # never touches vllmGpuTarget used to get no warning at all.
+              oldKernelGfx1151NoVllm = mkSys {
+                hardware.amd-npu.gpuTarget = "gfx1151";
+                boot.kernelPackages = pkgs.linuxPackages_6_12;
+              };
+              oldKernelGfx1151VllmOn = mkSys {
+                hardware.amd-npu = {
+                  gpuTarget = "gfx1151";
+                  enableVllm = true;
+                  vllmGpuTarget = "gfx1151";
+                };
+                boot.kernelPackages = pkgs.linuxPackages_6_12;
+              };
+              # Back-compat: an existing config that only ever set the legacy
+              # vLLM-only knob must keep warning, even though gpuTarget defaults
+              # to gfx1150.
+              oldKernelExplicitVllmTargetOnly = mkSys {
+                hardware.amd-npu.vllmGpuTarget = "gfx1151";
+                boot.kernelPackages = pkgs.linuxPackages_6_12;
+              };
+              oldKernelGfx1150 = mkSys {
+                hardware.amd-npu.gpuTarget = "gfx1150";
+                boot.kernelPackages = pkgs.linuxPackages_6_12;
+              };
+              newKernelGfx1151 = mkSys {
+                hardware.amd-npu.gpuTarget = "gfx1151";
+              };
+            in
+              pkgs.runCommand "module-eval-cwsr-warning" {
+                old1151NoVllm = builtins.toJSON oldKernelGfx1151NoVllm;
+                old1151VllmOn = builtins.toJSON oldKernelGfx1151VllmOn;
+                oldExplicitVllmTargetOnly = builtins.toJSON oldKernelExplicitVllmTargetOnly;
+                old1150 = builtins.toJSON oldKernelGfx1150;
+                new1151 = builtins.toJSON newKernelGfx1151;
+                passAsFile = ["old1151NoVllm" "old1151VllmOn" "oldExplicitVllmTargetOnly" "old1150" "new1151"];
+              } ''
+                grep -q cwsr_size "$old1151NoVllmPath" || { echo "gfx1151 + old kernel, vLLM off, via gpuTarget must warn"; exit 1; }
+                grep -q cwsr_size "$old1151VllmOnPath" || { echo "gfx1151 + old kernel + vLLM on must warn"; exit 1; }
+                grep -q cwsr_size "$oldExplicitVllmTargetOnlyPath" || { echo "legacy vllmGpuTarget-only config must still warn"; exit 1; }
+                grep -q cwsr_size "$old1150Path" && { echo "gfx1150 must not warn"; exit 1; }
+                grep -q cwsr_size "$new1151Path" && { echo "gfx1151 + new kernel must not warn"; exit 1; }
+                touch $out
+              '';
+
             # lemonade.settings must deep-merge over the module's computed
             # defaults — overriding one key without dropping its siblings — and
             # the unit must re-apply them on every start, else the option is
@@ -384,6 +460,43 @@
                 jq -e '.llamacpp.args == "--custom"' "$cfg" >/dev/null
                 jq -e '.host == "0.0.0.0"' "$cfg" >/dev/null         # user-only key preserved
                 [ "$(stat -c %a "$cfg")" = 600 ]                     # mode not widened
+
+                touch $out
+              '';
+
+            module-eval-lemonade-allowed-origins = let
+              sys =
+                (inputs.nixpkgs.lib.nixosSystem {
+                  inherit system;
+                  modules = [
+                    inputs.self.nixosModules.default
+                    {
+                      boot.loader.grub.enable = false;
+                      fileSystems."/" = {
+                        device = "/dev/sda1";
+                        fsType = "ext4";
+                      };
+                      hardware.amd-npu = {
+                        enable = true;
+                        enableLemonade = true;
+                        lemonade = {
+                          user = "testuser";
+                          host = "0.0.0.0";
+                          allowedOrigins = ["https://app.example.com" "http://192.168.1.10:3000"];
+                        };
+                      };
+                      users.users.testuser = {
+                        isNormalUser = true;
+                        extraGroups = ["video" "render"];
+                      };
+                    }
+                  ];
+                }).config;
+            in
+              pkgs.runCommand "module-eval-lemonade-allowed-origins" {
+                unit = sys.systemd.units."lemond.service".unit;
+              } ''
+                grep -qF 'Environment="LEMONADE_ALLOWED_ORIGINS=https://app.example.com,http://192.168.1.10:3000"' "$unit"/lemond.service
 
                 touch $out
               '';
@@ -522,6 +635,8 @@
                 || { echo "missing/changed NIX_LD"; exit 1; }
               grep -q 'NIX_LD_LIBRARY_PATH=/run/current-system/sw/share/nix-ld/lib' "$unit" \
                 || { echo "missing/changed NIX_LD_LIBRARY_PATH"; exit 1; }
+              ! grep -q 'LEMONADE_ALLOWED_ORIGINS' "$unit" \
+                || { echo "LEMONADE_ALLOWED_ORIGINS set on a host that never listed origins"; exit 1; }
               touch $out
             '';
 

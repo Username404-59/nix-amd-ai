@@ -195,19 +195,33 @@ in {
       description = ''
         Whether to wire the vLLM ROCm backend (vllm:rocm) into lemonade,
         repackaged from the upstream lemonade-sdk/vllm-rocm prebuilt. Requires
-        enableROCm. Strix Halo (gfx1151) needs a kernel with the CWSR fix;
-        lemonade reports vllm:rocm as unsupported otherwise. Experimental —
-        see noamsto/nix-amd-ai#63.
+        enableROCm. Experimental — see noamsto/nix-amd-ai#63.
+      '';
+    };
+
+    gpuTarget = mkOption {
+      type = types.enum ["gfx1150" "gfx1151"];
+      default = "gfx1150";
+      description = ''
+        The host's actual iGPU: gfx1150 (Strix Point) or gfx1151 (Strix
+        Halo). Drives the gfx1151 CWSR-kernel warning and the default for
+        vllmGpuTarget, so a llamacpp/sd-cpp-only host still declares its
+        chip without touching a vLLM option.
       '';
     };
 
     vllmGpuTarget = mkOption {
       type = types.enum ["gfx1150" "gfx1151"];
-      default = "gfx1150";
+      default = cfg.gpuTarget;
+      defaultText = lib.literalExpression "config.hardware.amd-npu.gpuTarget";
       description = ''
         Which lemonade-sdk/vllm-rocm prebuilt to install: gfx1150 (Strix Point)
         or gfx1151 (Strix Halo). Each bundles a TheRock ROCm built for that
-        exact target.
+        exact target. Defaults to gpuTarget; override only if vLLM needs a
+        different target than the host's real chip (e.g. testing). gfx1151
+        needs a kernel with the CWSR fix, backported or not, or ROCm can
+        crash any ROCm backend, not just vLLM (see the eval-time warning
+        this module emits when enableROCm is also set).
       '';
     };
 
@@ -272,6 +286,23 @@ in {
           These keys are re-applied on every `lemond` start, so they stay
           declarative; keys not listed here are left to whatever the web UI
           persisted in `''${LEMONADE_CACHE_DIR:-~/.cache/lemonade}/config.json`.
+        '';
+      };
+
+      allowedOrigins = mkOption {
+        type = types.listOf types.str;
+        default = [];
+        example = ["https://app.example.com" "http://192.168.1.10:3000"];
+        description = ''
+          Origins allowed to make cross-origin browser requests, emitted as
+          `LEMONADE_ALLOWED_ORIGINS`. Env-only upstream — there is no
+          config.json key, so `lemonade.settings` cannot reach it.
+
+          Loopback and non-http(s) desktop schemes (tauri://, file://) are
+          always allowed, so this is only needed for browsers on other
+          machines reaching a non-loopback `lemonade.host`. `["*"]` allows
+          any origin, which without an API key leaves the server open to any
+          site the browser visits.
         '';
       };
     };
@@ -399,6 +430,21 @@ in {
       }
     ];
 
+    warnings =
+      optional
+      (cfg.enableLemonade && cfg.lemonade.allowedOrigins == [] && !builtins.elem cfg.lemonade.host ["localhost" "127.0.0.1" "::1"])
+      "hardware.amd-npu.lemonade.host is non-loopback but lemonade.allowedOrigins is empty; browsers on other machines will get a 403 'Origin not allowed' error. Set lemonade.allowedOrigins to the origins that should reach it."
+      # Checks gpuTarget as well as vllmGpuTarget: the CWSR bug crashes every
+      # ROCm backend, so a llamacpp-only gfx1151 host must warn too.
+      # A warning rather than an assertion — the fix can be backported to an
+      # older kernel, which a version check cannot detect.
+      ++ optional
+      (cfg.enableLemonade
+        && cfg.enableROCm
+        && (cfg.gpuTarget == "gfx1151" || cfg.vllmGpuTarget == "gfx1151")
+        && !versionAtLeast config.boot.kernelPackages.kernel.version "6.18.4")
+      "A gfx1151 target is selected (hardware.amd-npu.gpuTarget / vllmGpuTarget), which needs Linux kernel >= 6.18.4 (or the CWSR fix backported) or ROCm can miscalculate VGPR counts and crash llamacpp:rocm, sd-cpp:rocm, and vllm:rocm. Kernel ${config.boot.kernelPackages.kernel.version} is below that; if it carries a backported fix, verify on the host with: grep -E \"cwsr_size|ctl_stack_size\" /sys/class/kfd/kfd/topology/nodes/*/properties";
+
     # Kernel configuration (NPU-only)
     boot.kernelModules = optionals cfg.enableNPU ["amdxdna"];
 
@@ -519,6 +565,11 @@ in {
           # them, so koko's loader can't find them without re-exporting here.
           NIX_LD = config.environment.sessionVariables.NIX_LD;
           NIX_LD_LIBRARY_PATH = config.environment.sessionVariables.NIX_LD_LIBRARY_PATH;
+        }
+        // optionalAttrs (cfg.lemonade.allowedOrigins != []) {
+          # env-only in lemonade >=11.5.0 — no config.json key to route this
+          # through lemonade.settings.
+          LEMONADE_ALLOWED_ORIGINS = concatStringsSep "," cfg.lemonade.allowedOrigins;
         };
       serviceConfig = {
         Type = "simple";
