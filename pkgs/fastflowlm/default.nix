@@ -63,7 +63,8 @@ stdenv.mkDerivation (finalAttrs: {
   #     by the loaded chat model; /v1/embeddings still requires `model`
   #     (#171) and refuses any tag but the loaded one. A model_list.json entry
   #     with a missing or non-string `details.family` now fails the load as
-  #     500 model_load_failed, not a 400 (#181).
+  #     500 model_load_failed, not a 400 (#181). A per-request `backend` the
+  #     family does not provide is refused 400 before anything is unloaded.
   #   - no-exception-text.patch (#175): handlers built client error bodies
   #     from a caught exception's e.what(), which for nlohmann errors
   #     reflects request bytes and library internals. Bodies now carry a
@@ -71,7 +72,9 @@ stdenv.mkDerivation (finalAttrs: {
   #     or any exception from a catch around prompt processing (where a chat
   #     template rejects the conversation), gets 400 invalid_request_error
   #     "Invalid request", as those catches did before; anything else gets
-  #     500 server_error "Internal error". A malformed max_prefill_len or
+  #     500 server_error "Internal error"; a ModelRequestError (phi4's
+  #     fail_inference) keeps its curated fixed text and the inner exception
+  #     text goes to the log. A malformed max_prefill_len or
   #     model path entry in model_list.json now fails the model load (500
   #     model_load_failed) rather than reaching the handler as a JSON error.
   #   - embed-task-prompt.patch (#174): handle_embeddings ignored the
@@ -100,10 +103,12 @@ stdenv.mkDerivation (finalAttrs: {
   #     answered any exception 400 invalid_request_error, so a decode-time
   #     NPU/runtime fault was reported as a non-retryable client error. The
   #     catch now answers 400 only while meta_info.prompt_tokens is still 0
-  #     (template/prefill) and 500 server_error after. The insert()+generate()
-  #     split the other handlers use was not taken because it would change
-  #     the answer for Qwen3.5 and Qwen3.6-MoE (their generate() forces think
-  #     tokens) and GPT-OSS (generate_with_prompt adds the
+  #     (template/prefill) and 500 server_error after. v1.0.9 moved this
+  #     route onto the insert()+generate() split the other handlers use,
+  #     which the patch keeps: Qwen3, Qwen3.5 and Qwen3.6-MoE insert() holds
+  #     back the tail of the generation prompt for generate() to feed, so the
+  #     per-model generate_with_prompt() overrides are not a safe route to
+  #     call (GPT-OSS content no longer carries the
   #     <|start|>assistant...<|end|> wrapper).
   #   - stream-chat-generate.patch (#187): streaming /api/chat ran insert()
   #     twice and never generate(), so every streaming /api/chat request
@@ -224,10 +229,12 @@ stdenv.mkDerivation (finalAttrs: {
   #     model_list.json paths in ensure_model_loaded broke the #181 contract.
   #     A bare tag (no ":size") whose size map is an empty object made
   #     rectify_model_tag() read end().key() (undefined behavior), and a
-  #     non-object size map threw invalid_iterator answered 400. v1.0.9 now
-  #     returns a missing or empty family's tag untouched; the patch makes a
-  #     non-object size map throw std::runtime_error, caught before anything
-  #     is unloaded and answered 500 model_load_failed (#205). And an entry with a missing or non-array
+  #     non-object size map threw invalid_iterator answered 400. v1.0.9's
+  #     untouched return for a missing or empty family is unreachable from a
+  #     request, since apply_support_filter erases empty families at startup:
+  #     a bare tag for one is refused 400 model_not_found. Only a non-object
+  #     size map reaches the patch's throw (std::runtime_error, caught before
+  #     anything is unloaded and answered 500 model_load_failed, #205). And an entry with a missing or non-array
   #     `files` had get_missing_files() swallow the type_error and report
   #     nothing missing, so a model not on disk reached
   #     LM_Config::_load_json's exit(1) and killed the process; the selected
@@ -298,6 +305,10 @@ stdenv.mkDerivation (finalAttrs: {
   #     existing catch turns it into a clean CLI error and exit 1; and the
   #     optional startup loads log the fault, drop ASR/embeddings and keep
   #     serving chat models instead of aborting startup.
+  #   - cancel-chat-nonstream.patch: v1.0.9's non-streaming /api/chat answers
+  #     200 with content "" when the request is cancelled before the first
+  #     token, while /api/generate and /v1/completions answer {} (see
+  #     cancel-client-disconnect.patch). The patch answers {} here too.
   # None of the patches carries attribution: require_field, safe_dump, the
   # model-identity checks and the embedding task-prompt mapping are ported
   # from OpenFlowLM-Next (Vegard Berget) -- the Co-authored-by trailer for
@@ -313,7 +324,8 @@ stdenv.mkDerivation (finalAttrs: {
   # client error, ignoring a prefill cancel in Qwen3_5_Omni::insert and in the
   # /api/generate, /api/chat and /v1/completions handlers, erasing a cancel
   # that lands before a streaming handler starts, exiting on a
-  # model_list.json entry with no `files` and a non-object size map, and
+  # model_list.json entry with no `files`, answering a pre-token cancel of
+  # non-streaming /api/chat with an empty completion, and
   # /api/cancel cancelling itself instead of its target; and leaving a
   # truncated stream instead of an error when a streaming insert()/generate()
   # fails after the first chunk (this repo's #199), and racing libc's shared
@@ -347,6 +359,7 @@ stdenv.mkDerivation (finalAttrs: {
     ./patches/thread-safe-localtime.patch
     ./patches/cancel-queued-request.patch
     ./patches/lm-config-throw.patch
+    ./patches/cancel-chat-nonstream.patch
   ];
 
   cargoDeps = rustPlatform.importCargoLock {

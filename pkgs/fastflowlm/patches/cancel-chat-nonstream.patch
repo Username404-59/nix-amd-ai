@@ -1,0 +1,21 @@
+diff -u a/src/server/rest_handler.cpp b/src/server/rest_handler.cpp
+--- a/src/server/rest_handler.cpp
++++ b/src/server/rest_handler.cpp
+@@ -1228,6 +1228,17 @@
+                 this->auto_chat_engine->clear_context();
+                 return;
+             }
++            if (response_text.empty() && meta_info.generated_tokens == 0 &&
++                (meta_info.stop_reason == CANCEL_DETECTED || (cancellation_token && cancellation_token->cancelled()))) {
++                meta_info.stop_reason = CANCEL_DETECTED;
++                header_print("❌ ", "Prefill Cancelled!");
++                send_response(json::object());
++                this->auto_chat_engine->clear_context();
++                return;
++            }
++            if (meta_info.stop_reason == CANCEL_DETECTED) {
++                header_print("❌ ", "Generation Cancelled!");
++            }
+             //std::string response_text = chat_engine->generate_with_prompt(meta_info, prompts, length_limit, std::cout, payload);
+             auto total_end_time = time_utils::now();
+             meta_info.total_duration = (uint64_t)time_utils::duration_ns(total_start_time, total_end_time).first;
