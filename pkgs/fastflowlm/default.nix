@@ -5,30 +5,39 @@
   cmake,
   ninja,
   pkg-config,
+  jq,
   boost,
   curl,
-  fftw,
-  fftwFloat,
-  fftwLongDouble,
-  ffmpeg,
-  readline,
-  libuuid,
   libdrm,
+  libedit,
+  libjpeg_turbo,
+  libogg,
+  libopus,
+  libuuid,
+  libvorbis,
   cargo,
   rustc,
   rustPlatform,
   autoPatchelfHook,
-  xrt,
+  versionCheckHook,
+  # Not plain xrt: the plugin has to sit next to the libxrt_coreutil flm
+  # loads, see pkgs/xrt-combined.
+  xrt-combined,
 }:
 stdenv.mkDerivation (finalAttrs: {
   pname = "fastflowlm";
-  version = "1.0.9";
+  version = "1.0.10";
+
+  __structuredAttrs = true;
+  strictDeps = true;
 
   src = fetchFromGitHub {
     owner = "ROCm";
     repo = "FastFlowLM";
-    rev = "v${finalAttrs.version}";
-    hash = "sha256-IzZTwdZHB2PsG6fTLxiiOy0K6b8DdXfP7aQYp2LxduQ=";
+    tag = "v${finalAttrs.version}";
+    hash = "sha256-lYSvSTGK1y66i+5C0ST2BsxU2WLJsMlAs2BA21V1fsY=";
+    # third_party/tokenizers-cpp is built below; third_party/xgrammar's
+    # sources are compiled straight into flm.
     fetchSubmodules = true;
   };
 
@@ -65,6 +74,8 @@ stdenv.mkDerivation (finalAttrs: {
   #     with a missing or non-string `details.family` now fails the load as
   #     500 model_load_failed, not a 400 (#181). A per-request `backend` the
   #     family does not provide is refused 400 before anything is unloaded.
+  #     v1.0.10's own swap (clear the tag and prompt cache, then download,
+  #     resolve and load in one try) is kept as the step after these checks.
   #   - no-exception-text.patch (#175): handlers built client error bodies
   #     from a caught exception's e.what(), which for nlohmann errors
   #     reflects request bytes and library internals. Bodies now carry a
@@ -74,9 +85,11 @@ stdenv.mkDerivation (finalAttrs: {
   #     "Invalid request", as those catches did before; anything else gets
   #     500 server_error "Internal error"; a ModelRequestError (phi4's
   #     fail_inference) keeps its curated fixed text and the inner exception
-  #     text goes to the log. A malformed max_prefill_len or
-  #     model path entry in model_list.json now fails the model load (500
-  #     model_load_failed) rather than reaching the handler as a JSON error.
+  #     text goes to the log. The SSE error event v1.0.10 sends when
+  #     /v1/chat/completions or /v1/completions fails mid-stream goes through
+  #     the same mapping. (A malformed max_prefill_len or model path entry in
+  #     model_list.json failing the load as 500 model_load_failed, which this
+  #     patch used to add, is upstream since v1.0.10.)
   #   - embed-task-prompt.patch (#174): handle_embeddings ignored the
   #     request's prompt_name/task_type and always embedded with task_query,
   #     so a document index was built as if every text were a query and
@@ -229,7 +242,7 @@ stdenv.mkDerivation (finalAttrs: {
   #     model_list.json paths in ensure_model_loaded broke the #181 contract.
   #     A bare tag (no ":size") whose size map is an empty object made
   #     rectify_model_tag() read end().key() (undefined behavior), and a
-  #     non-object size map threw invalid_iterator answered 400. v1.0.9's
+  #     non-object size map threw invalid_iterator answered 400. Upstream's
   #     untouched return for a missing or empty family is unreachable from a
   #     request, since apply_support_filter erases empty families at startup:
   #     a bare tag for one is refused 400 model_not_found. Only a non-object
@@ -265,8 +278,11 @@ stdenv.mkDerivation (finalAttrs: {
   #     data: {"error":{...}}) as the stream's final
   #     event, which terminates the chunked body, closes the connection and
   #     releases the slot; the body is the handler's existing generic error
-  #     (no exception text, #175). Covers /api/generate, /api/chat,
-  #     /v1/chat/completions and /v1/completions, including their outer catches.
+  #     (no exception text, #175). v1.0.10 ends /v1/chat/completions and
+  #     /v1/completions itself (an SSE error event, then [DONE]) when
+  #     generate() or finalize() throws, so this now matters for /api/generate
+  #     and /api/chat, and for any outer catch that still answers after the
+  #     first chunk.
   #   - thread-safe-localtime.patch (#197): flm serve runs its handlers on 10
   #     I/O threads, and three served-path sites called the non-reentrant
   #     localtime()/gmtime(), which share one process-wide static struct tm.
@@ -301,11 +317,11 @@ stdenv.mkDerivation (finalAttrs: {
   #     embed-gemma loads at `flm serve` startup. It now throws
   #     std::runtime_error and its callers handle it: ensure_model_loaded
   #     already answers the serve request path 500 model_load_failed
-  #     (#204/#205, kept, plus the post-get_auto_model check); pull_model's
-  #     existing catch turns it into a clean CLI error and exit 1; and the
-  #     optional startup loads log the fault, drop ASR/embeddings and keep
-  #     serving chat models instead of aborting startup.
-  #   - cancel-chat-nonstream.patch: v1.0.9's non-streaming /api/chat answers
+  #     (#204/#205, kept; after the unload, v1.0.10's own try covers it);
+  #     pull_model's existing catch turns it into a clean CLI error and exit
+  #     1; and the optional startup loads log the fault, drop ASR/embeddings
+  #     and keep serving chat models instead of aborting startup.
+  #   - cancel-chat-nonstream.patch: upstream's non-streaming /api/chat answers
   #     200 with content "" when the request is cancelled before the first
   #     token, while /api/generate and /v1/completions answer {} (see
   #     cancel-client-disconnect.patch). The patch answers {} here too.
@@ -313,7 +329,7 @@ stdenv.mkDerivation (finalAttrs: {
   # model-identity checks and the embedding task-prompt mapping are ported
   # from OpenFlowLM-Next (Vegard Berget) -- the Co-authored-by trailer for
   # that is on the branch commit per this repo's CLAUDE.md, not here.
-  # Still unfixed on ROCm/FastFlowLM main as of v1.0.9; drop once upstream
+  # Still unfixed on ROCm/FastFlowLM main as of v1.0.10; drop once upstream
   # fixes request validation, the throwing error-response dump, the status
   # mapping, model substitution, leaking exception text, ignoring the task
   # prompt, reporting the no-model sentinel in /api/ps, classifying /api/chat
@@ -327,14 +343,17 @@ stdenv.mkDerivation (finalAttrs: {
   # model_list.json entry with no `files`, answering a pre-token cancel of
   # non-streaming /api/chat with an empty completion, and
   # /api/cancel cancelling itself instead of its target; and leaving a
-  # truncated stream instead of an error when a streaming insert()/generate()
-  # fails after the first chunk (this repo's #199), and racing libc's shared
-  # static struct tm in the served time formatting (#197). (An insert()
-  # failure is pre-stream in all four handlers, so it keeps the unchanged
-  # HTTP 4xx/5xx path.) v1.0.9 fixed the NPU-lock leak, streaming /api/chat's
+  # truncated /api/generate or /api/chat stream instead of an error when
+  # generate() fails after the first chunk (this repo's #199), and racing
+  # libc's shared static struct tm in the served time formatting (#197). (An
+  # insert() failure is pre-stream in all four handlers, so it keeps the
+  # unchanged HTTP 4xx/5xx path.) v1.0.9 fixed the NPU-lock leak, streaming /api/chat's
   # double insert, the unlocked /v1/completions, releasing the lock before a
   # handler is done with the engine, and ignoring a client disconnect outside
-  # /v1/chat/completions, which this series carried before.
+  # /v1/chat/completions, which this series carried before. v1.0.10 clears
+  # the serving tag and prompt cache before a model swap, sizes prefill chunks
+  # per model, and ends a /v1 stream that fails after its first chunk with an
+  # error event; the series is rebased onto those.
   # A bump that breaks any patch fails the build rather than silently losing it.
   patches = [
     ./patches/server-error-handling.patch
@@ -360,6 +379,9 @@ stdenv.mkDerivation (finalAttrs: {
     ./patches/cancel-queued-request.patch
     ./patches/lm-config-throw.patch
     ./patches/cancel-chat-nonstream.patch
+    # Link libjpeg-turbo, opus, ogg and vorbis from nixpkgs instead of
+    # downloading and building pinned tarballs through ExternalProject.
+    ./patches/use-system-codecs.patch
   ];
 
   cargoDeps = rustPlatform.importCargoLock {
@@ -370,6 +392,7 @@ stdenv.mkDerivation (finalAttrs: {
 
   nativeBuildInputs = [
     cmake
+    jq
     ninja
     pkg-config
     cargo
@@ -381,15 +404,15 @@ stdenv.mkDerivation (finalAttrs: {
   buildInputs = [
     boost
     curl
-    fftw
-    fftwFloat
-    fftwLongDouble
-    ffmpeg
-    readline
-    libuuid
     libdrm
+    libedit
+    libjpeg_turbo
+    libogg
+    libopus
+    libuuid
+    libvorbis
     stdenv.cc.cc.lib
-    xrt
+    xrt-combined
   ];
 
   postPatch = ''
@@ -397,39 +420,48 @@ stdenv.mkDerivation (finalAttrs: {
     cp ${./Cargo.lock} third_party/tokenizers-cpp/rust/Cargo.lock
   '';
 
-  dontUseCmakeConfigure = true;
+  # The source root stays at the top of the checkout for cargoRoot and the
+  # patches; the CMake project is in src/.
+  cmakeDir = "../src";
 
-  configurePhase = ''
-    runHook preConfigure
-    cmake -S src -B src/build \
-      -GNinja \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DFLM_VERSION="${finalAttrs.version}" \
-      -DNPU_VERSION="32.0.203.304" \
-      "-DXRT_INCLUDE_DIR=${xrt}/opt/xilinx/xrt/include" \
-      "-DXRT_LIB_DIR=${xrt}/opt/xilinx/xrt/lib" \
-      -DCMAKE_INSTALL_PREFIX=$out \
-      -DCMAKE_XCLBIN_PREFIX=$out/share/flm
-    runHook postConfigure
+  # XRT is found through its pkg-config file, so no XRT_INCLUDE_DIR/XRT_LIB_DIR.
+  cmakeFlags = [
+    (lib.cmakeFeature "FLM_VERSION" finalAttrs.version)
+    (lib.cmakeFeature "CMAKE_XCLBIN_PREFIX" "${placeholder "out"}/share/flm")
+    # The cmake setup hook passes these as absolute paths, but CMakeLists.txt
+    # joins CMAKE_INSTALL_LIBDIR onto $ORIGIN/.. for flm's RPATH. Single output,
+    # so the relative forms are equivalent.
+    # See https://github.com/NixOS/nixpkgs/issues/144170
+    (lib.cmakeFeature "CMAKE_INSTALL_BINDIR" "bin")
+    (lib.cmakeFeature "CMAKE_INSTALL_LIBDIR" "lib")
+  ];
+
+  # NPU_VERSION is the minimum AMD NPU driver version, kept in
+  # src/CMakePresets.json upstream. Currently only used on Windows.
+  preConfigure = ''
+    cmakeFlagsArray+=(
+      "-DNPU_VERSION=$(jq -er '
+        .configurePresets[]
+        | select(.name == "common-default")
+        | .cacheVariables.NPU_VERSION
+      ' src/CMakePresets.json)"
+    )
   '';
 
-  buildPhase = ''
-    runHook preBuild
-    ninja -C src/build
-    runHook postBuild
-  '';
-
-  installPhase = ''
-    runHook preInstall
-    ninja -C src/build install
-    runHook postInstall
-  '';
+  nativeInstallCheckInputs = [
+    versionCheckHook
+  ];
+  doInstallCheck = true;
 
   meta = {
     description = "NPU-optimized LLM runtime for AMD Ryzen AI";
     homepage = "https://github.com/ROCm/FastFlowLM";
+    changelog = "https://github.com/ROCm/FastFlowLM/releases/tag/${finalAttrs.src.tag}";
     # Source is MIT; the NPU kernels in share/flm are proprietary (see TERMS.md).
     license = [lib.licenses.mit lib.licenses.unfree];
+    # The prebuilt engine libraries (src/lib/xrt/*.so) are host code; the
+    # xclbins are NPU firmware.
+    sourceProvenance = with lib.sourceTypes; [fromSource binaryNativeCode binaryFirmware];
     platforms = ["x86_64-linux"];
     mainProgram = "flm";
   };

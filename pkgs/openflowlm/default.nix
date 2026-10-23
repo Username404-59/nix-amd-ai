@@ -1,8 +1,6 @@
 # Build shape (tokenizers-cpp Cargo.lock, SPM_ABSL_PROVIDER=package) adapted
 # from @eyduh's packaging:
 # https://github.com/eyduh/OpenFlowLM-Next/blob/62653a0bdca21264303bb347f66423b44f3e56c3/nix/package.nix
-# Not self-wrapped: like pkgs.fastflowlm, the XRT LD_LIBRARY_PATH comes from
-# hardware.amd-npu.fastflowlm.package's wrapper.
 {
   lib,
   stdenv,
@@ -27,7 +25,11 @@
   rustc,
   rustPlatform,
   autoPatchelfHook,
+  # Linked against xrt-combined so oflm finds the NPU plugin (see
+  # pkgs/xrt-combined); the kernels only need xrt's xclbinutil, and stay on
+  # plain xrt so a plugin bump does not rebuild them.
   xrt,
+  xrt-combined,
   mlir-aie,
   llvm-aie,
 }:
@@ -75,7 +77,7 @@ stdenv.mkDerivation (finalAttrs: {
   ];
 
   buildInputs = [
-    xrt
+    xrt-combined
     abseil-cpp
     boost
     curl
@@ -117,7 +119,6 @@ stdenv.mkDerivation (finalAttrs: {
   ];
 
   preConfigure = ''
-    export PKG_CONFIG_PATH="${xrt}/opt/xilinx/xrt/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
     # Upstream's OFLM_BUILD_KERNELS=ON exports into src/xclbins for
     # cmake --install to ship next to the tree's closed sets.
     cp -r ${finalAttrs.passthru.kernels}/xclbins/. src/xclbins/

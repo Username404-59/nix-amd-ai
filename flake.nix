@@ -249,10 +249,12 @@
           else let
             libwebsockets = libwebsocketsOverride pinned;
             xrt = pinned.callPackage ./pkgs/xrt {};
-            fastflowlm = pinned.callPackage ./pkgs/fastflowlm {inherit xrt;};
+            xrt-plugin-amdxdna = pinned.callPackage ./pkgs/xrt-plugin-amdxdna {inherit xrt;};
+            xrt-combined = pinned.callPackage ./pkgs/xrt-combined {inherit xrt xrt-plugin-amdxdna;};
+            fastflowlm = pinned.callPackage ./pkgs/fastflowlm {inherit xrt-combined;};
             llvm-aie = pinned.callPackage ./pkgs/llvm-aie {};
             mlir-aie = pinned.callPackage ./pkgs/mlir-aie {inherit llvm-aie;};
-            openflowlm = pinned.callPackage ./pkgs/openflowlm {inherit xrt mlir-aie llvm-aie;};
+            openflowlm = pinned.callPackage ./pkgs/openflowlm {inherit xrt xrt-combined mlir-aie llvm-aie;};
             llama-cpp-base = llamaCppPin pinned pinned.llama-cpp;
             llama-cpp = llamaCppNoWebUi pinned llama-cpp-base;
             llama-cpp-vulkan = withOwnVulkanDriver pinned (llamaCppNoWebUi pinned (llama-cpp-base.override {vulkanSupport = true;}));
@@ -268,7 +270,7 @@
             };
             stable-diffusion-cpp-vulkan = withOwnVulkanDriver pinned (pinned.stable-diffusion-cpp.override {vulkanSupport = true;});
           in {
-            inherit xrt fastflowlm llama-cpp llama-cpp-vulkan llama-cpp-vulkan-unsloth llama-cpp-rocm llama-cpp-rocm-gsqhalo libwebsockets;
+            inherit xrt xrt-plugin-amdxdna xrt-combined fastflowlm llama-cpp llama-cpp-vulkan llama-cpp-vulkan-unsloth llama-cpp-rocm llama-cpp-rocm-gsqhalo libwebsockets;
             inherit whisper-cpp-vulkan stable-diffusion-cpp-rocm stable-diffusion-cpp-vulkan;
             # The module's CPU backends link these; the consumer's copies would
             # build against the pinned llama-cpp above and break on version skew.
@@ -276,7 +278,6 @@
             inherit mlir-aie llvm-aie openflowlm;
             ds4 = pinned.callPackage ./pkgs/ds4 {};
             strata = pinned.callPackage ./pkgs/strata {};
-            xrt-plugin-amdxdna = pinned.callPackage ./pkgs/xrt-plugin-amdxdna {inherit xrt;};
             lemonade = pinned.callPackage ./pkgs/lemonade {
               inherit fastflowlm llama-cpp-vulkan llama-cpp-rocm libwebsockets;
               inherit whisper-cpp-vulkan stable-diffusion-cpp-rocm stable-diffusion-cpp-vulkan;
@@ -348,10 +349,12 @@
         # AMD NPU/XRT/ROCm/Vulkan stack — Linux + AMD-hardware only.
         linuxPackages = let
           xrt = pkgs.callPackage ./pkgs/xrt {};
-          fastflowlm = pkgs.callPackage ./pkgs/fastflowlm {inherit xrt;};
+          xrt-plugin-amdxdna = pkgs.callPackage ./pkgs/xrt-plugin-amdxdna {inherit xrt;};
+          xrt-combined = pkgs.callPackage ./pkgs/xrt-combined {inherit xrt xrt-plugin-amdxdna;};
+          fastflowlm = pkgs.callPackage ./pkgs/fastflowlm {inherit xrt-combined;};
           llvm-aie = pkgs.callPackage ./pkgs/llvm-aie {};
           mlir-aie = pkgs.callPackage ./pkgs/mlir-aie {inherit llvm-aie;};
-          openflowlm = pkgs.callPackage ./pkgs/openflowlm {inherit xrt mlir-aie llvm-aie;};
+          openflowlm = pkgs.callPackage ./pkgs/openflowlm {inherit xrt xrt-combined mlir-aie llvm-aie;};
           llama-cpp-base = llamaCppPin pkgs pkgs.llama-cpp;
           llama-cpp = llamaCppNoWebUi pkgs llama-cpp-base;
           llama-cpp-vulkan = withOwnVulkanDriver pkgs (llamaCppNoWebUi pkgs (llama-cpp-base.override {vulkanSupport = true;}));
@@ -374,11 +377,10 @@
             stable-diffusion-cpp = pkgs.stable-diffusion-cpp;
           };
         in {
-          inherit xrt fastflowlm llama-cpp llama-cpp-vulkan llama-cpp-vulkan-unsloth llama-cpp-rocm llama-cpp-rocm-gsqhalo libwebsockets lemonade;
+          inherit xrt xrt-plugin-amdxdna xrt-combined fastflowlm llama-cpp llama-cpp-vulkan llama-cpp-vulkan-unsloth llama-cpp-rocm llama-cpp-rocm-gsqhalo libwebsockets lemonade;
           inherit whisper-cpp-vulkan stable-diffusion-cpp-rocm stable-diffusion-cpp-vulkan;
           inherit mlir-aie llvm-aie openflowlm;
           ds4 = pkgs.callPackage ./pkgs/ds4 {};
-          xrt-plugin-amdxdna = pkgs.callPackage ./pkgs/xrt-plugin-amdxdna {inherit xrt;};
           # What `hardware.amd-npu.lemonade.desktopApp.enable = false` selects;
           # built here so headless hosts substitute it rather than compile it.
           lemonade-headless = lemonade.override {withDesktopApp = false;};
@@ -697,6 +699,20 @@
           if isLinux
           then {
             benchmark-go-gate = benchmarkGate;
+            # xrt-plugin-amdxdna compiles the shim against xrt.src's internal
+            # headers and xrt-combined loads it into pkgs.xrt's libxrt_core,
+            # while xdna-driver pins its own XRT as the xrt submodule. Bumping
+            # one without the other would build the plugin against a different
+            # XRT than the one it runs in.
+            xrt-plugin-xrt-revision =
+              pkgs.runCommand "xrt-plugin-xrt-revision" {
+                PLUGIN_XRT = "${linuxPackages.xrt-plugin-amdxdna.src}/xrt";
+                XRT = linuxPackages.xrt.src;
+              } ''
+                diff -rq "$PLUGIN_XRT" "$XRT" \
+                  || { echo "amd/xdna-driver's xrt submodule differs from pkgs/xrt's source; bump them together"; exit 1; }
+                touch $out
+              '';
             # Smoke checks for the IRON toolchain packages: prove the CLI tools
             # run, the Python module imports with the package on PYTHONPATH, and
             # the Peano clang still carries the AIE targets. No NPU needed.
@@ -1515,7 +1531,7 @@
                 touch $out
               '';
 
-            # fastflowlm.package feeds both the wrapped system package and
+            # fastflowlm.package feeds both the system package and
             # lemonade's flm.npu_bin (via the stable /etc symlink). Eval-only: the
             # asserted strings are store paths whose contexts are discarded so the
             # check never builds fastflowlm or the XRT closure.
@@ -1547,6 +1563,9 @@
                 }).config;
               stub = pkgs.writeShellScriptBin "oflm" "exit 0" // {meta.mainProgram = "oflm";};
               flmNpu = c: builtins.unsafeDiscardStringContext c.environment.etc."lemonade/backends/flm-npu".source;
+              # Linked directly, not through a wrapper: the packages find the
+              # NPU plugin via xrt-combined (pkgs/xrt-combined).
+              exeOf = c: builtins.unsafeDiscardStringContext (inputs.nixpkgs.lib.getExe c.hardware.amd-npu.fastflowlm.package);
               defaultsOf = c: c.systemd.services.lemond.environment.LEMONADE_DEFAULTS_PATH;
               def = mkSys {};
               swapped = mkSys {hardware.amd-npu.fastflowlm.package = stub;};
@@ -1558,6 +1577,9 @@
                 defaultBin = flmNpu def;
                 swappedBin = flmNpu swapped;
                 realBin = flmNpu real;
+                defaultExe = exeOf def;
+                swappedExe = exeOf swapped;
+                realExe = exeOf real;
                 defaultDefaults = defaultsOf def;
                 swappedDefaults = defaultsOf swapped;
                 realDefaults = defaultsOf real;
@@ -1566,9 +1588,12 @@
                 realLemondNoUpdate = real.systemd.services.lemond.environment.OFLM_DISABLE_UPDATE_CHECK or "";
                 realSessionNoUpdate = real.environment.sessionVariables.OFLM_DISABLE_UPDATE_CHECK or "";
               } ''
-                case "$defaultBin" in *-fastflowlm-wrapped/bin/flm) ;; *) echo "default: $defaultBin" >&2; exit 1 ;; esac
-                case "$swappedBin" in *-fastflowlm-wrapped/bin/oflm) ;; *) echo "swapped: $swappedBin" >&2; exit 1 ;; esac
-                case "$realBin" in *-fastflowlm-wrapped/bin/oflm) ;; *) echo "real: $realBin" >&2; exit 1 ;; esac
+                [ "$defaultBin" = "$defaultExe" ] && case "$defaultBin" in *-fastflowlm-*/bin/flm) ;; *) false ;; esac \
+                  || { echo "default: $defaultBin" >&2; exit 1; }
+                [ "$swappedBin" = "$swappedExe" ] && case "$swappedBin" in */bin/oflm) ;; *) false ;; esac \
+                  || { echo "swapped: $swappedBin" >&2; exit 1; }
+                [ "$realBin" = "$realExe" ] && case "$realBin" in *-openflowlm-*/bin/oflm) ;; *) false ;; esac \
+                  || { echo "real: $realBin" >&2; exit 1; }
                 for f in "$defaultDefaults" "$swappedDefaults" "$realDefaults"; do
                   jq -e '.flm.npu_bin == "/etc/lemonade/backends/flm-npu"' "$f" >/dev/null
                   jq -e '.flm.prefer_system == true' "$f" >/dev/null
@@ -2244,8 +2269,10 @@
                 touch $out
               '';
 
-            # An allowlist, not a blacklist: lemond's LD_LIBRARY_PATH is exactly
-            # xrt-combined/lib or unset, so no host library dir can return (#215).
+            # lemond sets no LD_LIBRARY_PATH, NPU or not: the NPU runtimes find
+            # the plugin through xrt-combined on their RUNPATH, and anything set
+            # here would reach every backend lemond spawns, where a host library
+            # dir shadows the pinned ones (#215).
             module-eval-lemond-ld-library-path = let
               mkEnv = extra:
                 (inputs.nixpkgs.lib.nixosSystem {
@@ -2285,15 +2312,14 @@
                 enableROCm = true;
                 enableVulkan = true;
               };
-              actual = builtins.unsafeDiscardStringContext (withNpu.LD_LIBRARY_PATH or "<unset>");
-              expected = builtins.unsafeDiscardStringContext (withNpu.XILINX_XRT + "/lib");
+              npuLd = builtins.unsafeDiscardStringContext (withNpu.LD_LIBRARY_PATH or "<unset>");
               noNpuLd = builtins.unsafeDiscardStringContext (noNpu.LD_LIBRARY_PATH or "<unset>");
             in
               pkgs.runCommand "module-eval-lemond-ld-library-path" {
-                inherit actual expected noNpuLd;
+                inherit npuLd noNpuLd;
               } ''
-                [ "$actual" = "$expected" ] \
-                  || { echo "lemond LD_LIBRARY_PATH is '$actual', expected '$expected'"; exit 1; }
+                [ "$npuLd" = "<unset>" ] \
+                  || { echo "lemond LD_LIBRARY_PATH is '$npuLd' with the NPU, expected unset"; exit 1; }
                 [ "$noNpuLd" = "<unset>" ] \
                   || { echo "lemond LD_LIBRARY_PATH is '$noNpuLd' without the NPU, expected unset"; exit 1; }
                 touch $out
